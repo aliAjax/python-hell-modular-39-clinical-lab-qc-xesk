@@ -140,6 +140,52 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def update_two_atomically(self, first_id, first_version, first_status, first_data,
+                              second_id, second_version, second_status, second_data):
+        """Update two entities in one transaction so a lot handover can never
+        leave both lots active or both inactive."""
+        now = utcnow()
+        first_payload = json.dumps(first_data, ensure_ascii=False, sort_keys=True)
+        second_payload = json.dumps(second_data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id, version FROM entities WHERE id IN (?, ?)",
+                (first_id, second_id),
+            ).fetchall()
+            current = {row["id"]: int(row["version"]) for row in rows}
+            if first_id not in current or second_id not in current:
+                missing = first_id if first_id not in current else second_id
+                raise NotFoundError("entity not found: " + missing)
+            if first_version is not None and current[first_id] != int(first_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (first_version, current[first_id])
+                )
+            if second_version is not None and current[second_id] != int(second_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (second_version, current[second_id])
+                )
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (first_status, first_payload, now, first_id, current[first_id]),
+            )
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (second_status, second_payload, now, second_id, current[second_id]),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(first_id), self.get_entity(second_id)
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(

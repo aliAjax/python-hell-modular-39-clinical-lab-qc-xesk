@@ -27,6 +27,16 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class ReleaseBlocked(ConflictError):
+    """Release preconditions failed; the result batch keeps its current status."""
+
+    def __init__(self, reasons, context=None):
+        self.reasons = [str(reason) for reason in reasons]
+        self.context = dict(context or {})
+        message = "; ".join(self.reasons)
+        super().__init__(message)
+
+
 class Role(str, Enum):
     viewer = "viewer"
     reporter = "reporter"
