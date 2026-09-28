@@ -12,6 +12,34 @@ def calibration_is_valid(calibration_due, as_of):
     return str(calibration_due)[:10] >= str(as_of)[:10]
 
 
+# QC runs still out of control: rejected, under investigation or being retested.
+OPEN_QC_FAILURE_STATUSES = ("rejected", "investigated", "retesting")
+EPOCH = "1970-01-01T00:00:00Z"
+
+
+def calibration_history(instrument):
+    """Calibration certificate timeline of an instrument, oldest first."""
+    history = list((instrument or {}).get("data", {}).get("calibration_history") or [])
+    if history:
+        return history
+    due = (instrument or {}).get("data", {}).get("calibration_due")
+    if due:
+        # Records created before certificate history was tracked: treat the
+        # stored due date as an epoch-valid baseline so it keeps working.
+        return [{"certificate_id": None, "calibration_due": due, "calibrated_at": EPOCH}]
+    return []
+
+
+def effective_calibration(instrument, as_of):
+    """Certificate in force on the instrument at a given moment."""
+    moment = str(as_of or "")
+    current = None
+    for entry in calibration_history(instrument):
+        if str(entry.get("calibrated_at", EPOCH)) <= moment:
+            current = entry
+    return current
+
+
 def evaluate_qc(history, value, target, sd, config=None):
     """Evaluate one QC value against numeric and multi-rule criteria."""
     config = dict(config or {})
@@ -94,7 +122,17 @@ def _validate_qc_lot(actor, data, lookup):
 def _validate_instrument(actor, data, lookup):
     if not str(data.get("serial", "")).strip():
         raise ValidationError("instrument serial is required")
-    return {"calibration_due": data.get("calibration_due")}
+    # Seed the certificate timeline so audits always know which certificate
+    # covered the first runs on the instrument.
+    calibrated_at = data.get("calibrated_at") or EPOCH
+    history = [
+        {
+            "certificate_id": data.get("certificate_id"),
+            "calibration_due": data.get("calibration_due"),
+            "calibrated_at": calibrated_at,
+        }
+    ]
+    return {"calibration_due": data.get("calibration_due"), "calibration_history": history}
 
 
 def _validate_qc_run(actor, data, lookup):
@@ -105,6 +143,13 @@ def _validate_qc_run(actor, data, lookup):
         raise ValidationError("assay, qc lot and instrument are required")
     if lot["data"].get("assay_id") != assay["id"]:
         raise ValidationError("qc lot does not belong to the assay")
+    if lot["status"] in ("retired", "suspended"):
+        raise ValidationError("qc lot is not active: " + lot["status"])
+    if lot["status"] == "active" and lot["data"].get("activated_at"):
+        # From the takeover moment the new lot owns new runs; the retired lot
+        # must not be used even though its historical runs stay valid.
+        if str(data.get("run_at", "")) < str(lot["data"]["activated_at"]):
+            raise ValidationError("qc run predates the lot takeover time")
     try:
         value = float(data.get("value"))
     except (TypeError, ValueError):
@@ -113,12 +158,19 @@ def _validate_qc_run(actor, data, lookup):
 
 
 def _validate_result_batch(actor, data, lookup):
-    if not _find_one(lookup, "assay", "id", data.get("assay_id")):
+    assay = _find_one(lookup, "assay", "id", data.get("assay_id"))
+    instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
+    run = _find_one(lookup, "qc_run", "id", data.get("qc_run_id"))
+    if not assay:
         raise ValidationError("assay does not exist")
-    if not _find_one(lookup, "instrument", "id", data.get("instrument_id")):
+    if not instrument:
         raise ValidationError("instrument does not exist")
-    if not _find_one(lookup, "qc_run", "id", data.get("qc_run_id")):
+    if not run:
         raise ValidationError("qc run does not exist")
+    if run["data"].get("assay_id") != assay["id"]:
+        raise ValidationError("qc run does not belong to the assay")
+    if run["data"].get("instrument_id") != instrument["id"]:
+        raise ValidationError("qc run was not performed on the instrument")
     if int(data.get("patient_count", 0)) < 0:
         raise ValidationError("patient_count cannot be negative")
     return {}
@@ -150,22 +202,127 @@ def _validate_evaluate(actor, entity, data, lookup):
     return result
 
 
+def _release_snapshot(batch, run, assay, lot, instrument, run_certificate, batch_certificate):
+    return {
+        "assay_id": batch["data"].get("assay_id"),
+        "instrument_id": batch["data"].get("instrument_id"),
+        "qc_run_id": run["id"],
+        "qc_lot_id": lot["id"],
+        "lot_no": lot["data"].get("lot_no"),
+        "lot_status": lot["status"],
+        "lot_takeover_at": lot["data"].get("activated_at")
+        or lot["data"].get("switched_at"),
+        "lot_retires_at": lot["data"].get("retired_at"),
+        "lot_expires_at": lot["data"].get("expires_at"),
+        "qc_run_at": run["data"].get("run_at"),
+        "result_run_at": batch["data"].get("run_at"),
+        "qc_certificate_id": (run_certificate or {}).get("certificate_id"),
+        "qc_certificate_due": (run_certificate or {}).get("calibration_due"),
+        "current_certificate_id": (batch_certificate or {}).get("certificate_id"),
+        "current_certificate_due": (batch_certificate or {}).get("calibration_due"),
+        "instrument_status": instrument["status"] if instrument else None,
+    }
+
+
 def _validate_release(actor, entity, data, lookup):
+    batch_assay_id = entity["data"].get("assay_id")
+    instrument_id = entity["data"].get("instrument_id")
+    run_at = str(entity["data"].get("run_at", ""))
     run = _find_one(lookup, "qc_run", "id", entity["data"].get("qc_run_id"))
-    instrument = _find_one(lookup, "instrument", "id", entity["data"].get("instrument_id"))
+    assay = _find_one(lookup, "assay", "id", batch_assay_id)
+    instrument = _find_one(lookup, "instrument", "id", instrument_id)
     if not run or run["status"] != "accepted":
         raise ConflictError("result batch can only be released with an accepted QC run")
-    if not instrument or instrument["status"] != "ready":
+    if not assay or run["data"].get("assay_id") != assay["id"]:
+        raise ConflictError("qc run assay does not match the result batch assay")
+    if not instrument or run["data"].get("instrument_id") != instrument["id"]:
+        raise ConflictError("qc run instrument does not match the result batch instrument")
+    if assay["status"] != "active":
+        raise ConflictError("assay is not active")
+    if instrument["status"] != "ready":
         raise ConflictError("instrument is not ready")
-    if not calibration_is_valid(instrument["data"].get("calibration_due"), entity["data"].get("run_at")):
-        raise ConflictError("instrument calibration is not valid at result time")
+
+    lot = _find_one(lookup, "qc_lot", "id", run["data"].get("qc_lot_id"))
+    if not lot:
+        raise ConflictError("qc lot used by the run no longer exists")
+    takeover_at = lot["data"].get("activated_at") or lot["data"].get("switched_at")
+    lot_run_at = str(run["data"].get("run_at", ""))
+
+    if lot["status"] == "active":
+        # New lot only governs runs performed from the takeover moment; earlier
+        # results still belong to the previous lot and must use that lot's run.
+        if takeover_at and lot_run_at < str(takeover_at):
+            raise ConflictError("qc run predates the lot takeover time")
+    elif lot["status"] == "retired":
+        retired_at = lot["data"].get("retired_at")
+        if not retired_at:
+            raise ConflictError("retired qc lot has no recorded switch time")
+        # Results from before the switch are still judged under the old lot;
+        # anything after it must ride the new lot that took over.
+        if lot_run_at >= str(retired_at) or run_at >= str(retired_at):
+            raise ConflictError("qc lot was retired before the result run time; use the new lot")
+    else:
+        raise ConflictError("qc lot is not active: " + lot["status"])
+
+    if str(lot["data"].get("expires_at", ""))[:10] < run_at[:10]:
+        raise ConflictError("qc lot had expired at result run time")
+
+    # Open out-of-control runs of the same lot on the same instrument keep the
+    # lot's results on hold until the failure is closed.
+    open_failures = []
+    for other in lookup("qc_run", "instrument_id", instrument_id) or []:
+        if other["data"].get("qc_lot_id") != lot["id"]:
+            continue
+        if other["data"].get("assay_id") != batch_assay_id:
+            continue
+        if other["status"] in OPEN_QC_FAILURE_STATUSES:
+            open_failures.append(other["id"])
+    if open_failures:
+        raise ConflictError(
+            "qc lot has unresolved out-of-control runs: " + ", ".join(sorted(open_failures))
+        )
+
+    run_certificate = effective_calibration(instrument, run["data"].get("run_at"))
+    batch_certificate = effective_calibration(instrument, run_at)
+    if not batch_certificate:
+        raise ConflictError("instrument has no calibration certificate covering the result run time")
+    if not calibration_is_valid(batch_certificate.get("calibration_due"), run_at):
+        raise ConflictError("calibration certificate is expired at result run time")
+    if not run_certificate:
+        raise ConflictError("instrument has no calibration certificate covering the qc run time")
+    if not calibration_is_valid(run_certificate.get("calibration_due"), run["data"].get("run_at")):
+        raise ConflictError("calibration certificate was expired when qc was run")
+    # A certificate renewal between QC and release invalidates the QC evidence:
+    # the instrument must be re-qualified under the new certificate first.
+    if run_certificate.get("certificate_id") != batch_certificate.get("certificate_id"):
+        raise ConflictError(
+            "calibration certificate changed after qc run (qc used %s, current %s); rerun qc"
+            % (run_certificate.get("certificate_id"), batch_certificate.get("certificate_id"))
+        )
+
     active_holds = []
-    for batch in lookup("result_batch", "instrument_id", entity["data"].get("instrument_id")) or []:
+    for batch in lookup("result_batch", "instrument_id", instrument_id) or []:
         if batch["id"] != entity["id"] and batch["status"] == "intercepted":
             active_holds.append(batch)
     if active_holds:
         raise ConflictError("an intercepted result batch must be resolved first")
-    return {"released_by": actor.user_id}
+
+    snapshot = _release_snapshot(
+        entity, run, assay, lot, instrument, run_certificate, batch_certificate
+    )
+    return {"released_by": actor.user_id, "release_validation": snapshot, "_audit": snapshot}
+
+
+def _validate_calibrate(actor, entity, data, lookup):
+    calibrated_at = data.get("calibrated_at")
+    history = calibration_history(entity)
+    last = history[-1] if history else None
+    if last and calibrated_at and str(calibrated_at) < str(last.get("calibrated_at", EPOCH)):
+        raise ValidationError("calibration cannot be older than the previous one")
+    if data.get("calibration_due") and calibrated_at:
+        if str(data["calibration_due"])[:10] < str(calibrated_at)[:10]:
+            raise ValidationError("calibration due date cannot precede calibration time")
+    return {}
 
 
 def _validate_qc_retest(actor, entity, data, lookup):
@@ -183,7 +340,12 @@ def _validate_switch_lot(actor, entity, data, lookup):
         raise ValidationError("previous active lot is required")
     if previous["data"].get("assay_id") != entity["data"].get("assay_id"):
         raise ValidationError("lots must belong to the same assay")
-    return {"replaces_lot_id": previous["id"], "switched_at": data.get("switched_at")}
+    switched_at = data.get("switched_at")
+    return {
+        "replaces_lot_id": previous["id"],
+        "switched_at": switched_at,
+        "activated_at": switched_at,
+    }
 
 
 def _validate_correct(actor, entity, data, lookup):
@@ -305,6 +467,7 @@ class RuleEngine:
         ("result_batch", "release"): _validate_release,
         ("result_batch", "retest"): _validate_qc_retest,
         ("qc_lot", "switch_in"): _validate_switch_lot,
+        ("instrument", "calibrate"): _validate_calibrate,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,
     }

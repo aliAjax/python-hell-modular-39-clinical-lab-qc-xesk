@@ -140,6 +140,42 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def update_entities_many(self, updates):
+        """Atomically apply several (entity_id, expected_version, status, data) updates.
+
+        Every update is version checked; a conflict on any one rolls the whole
+        batch back, which is what lot takeover relies on.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for entity_id, expected_version, status, data in updates:
+                payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (entity_id,)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + entity_id)
+                current_version = int(row["version"])
+                if expected_version is not None and current_version != int(expected_version):
+                    raise ConflictError(
+                        "version conflict: expected %s, found %s"
+                        % (expected_version, current_version)
+                    )
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (status, payload, now, entity_id),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return [self.get_entity(entity_id) for entity_id, _, _, _ in updates]
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(
